@@ -54,12 +54,15 @@ object DataSourceUtils extends PredicateHelper {
    * Data Source V1 callers pass a [[CaseInsensitiveMap]] that is unwrapped to `originalMap` here
    * unless `legacyLowercaseKeys` is enabled. When `originalMap` contains multiple spellings of
    * the same key that differ only in case, only the entry matching the case-insensitive lookup is
-   * set so the Hadoop configuration agrees with `CaseInsensitiveMap.get`.
+   * set so the Hadoop configuration agrees with `CaseInsensitiveMap.get`, unless
+   * `legacyPreserveOriginalMap` is enabled (used by [[FileFormatWriter]] when the legacy flag is
+   * active to restore the previous write-side behavior).
    */
   def mergeOptionsIntoHadoopConf(
       options: Map[String, String],
       conf: Configuration,
-      legacyLowercaseKeys: Boolean = false): Unit = {
+      legacyLowercaseKeys: Boolean = false,
+      legacyPreserveOriginalMap: Boolean = false): Unit = {
     val rawOptions: Iterable[(String, String)] = options match {
       case ci: CaseInsensitiveMap[String @unchecked] if !legacyLowercaseKeys =>
         if (ci.originalMap.size == ci.keyLowerCasedMap.size) {
@@ -71,10 +74,17 @@ object DataSourceUtils extends PredicateHelper {
             acc.updated(k.toLowerCase(Locale.ROOT), (k, v))
           }.values
         }
+      case ci: CaseInsensitiveMap[String @unchecked] if legacyPreserveOriginalMap =>
+        ci.originalMap
       case other => other
     }
     rawOptions.foreach { case (k, v) =>
-      if ((v ne null) && !k.equalsIgnoreCase("path") && !k.equalsIgnoreCase("paths")) {
+      val isPathOption = if (legacyLowercaseKeys) {
+        k == "path" || k == "paths"
+      } else {
+        k.equalsIgnoreCase("path") || k.equalsIgnoreCase("paths")
+      }
+      if ((v ne null) && !isPathOption) {
         conf.set(k, v)
       }
     }

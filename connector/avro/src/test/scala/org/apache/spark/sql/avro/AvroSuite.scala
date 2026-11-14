@@ -4185,6 +4185,40 @@ class AvroV2Suite extends AvroSuite with ExplainSuiteHelper {
     }
   }
 
+  test("SPARK-30628: Avro source v2: runtime filters prune partitions") {
+    withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "false",
+        SQLConf.DYNAMIC_PARTITION_PRUNING_FALLBACK_FILTER_RATIO.key -> "2") {
+      withTempPath { dir =>
+        val factPath = new File(dir, "fact").getCanonicalPath
+        val dimPath = new File(dir, "dim").getCanonicalPath
+        spark.range(100).selectExpr("id", "CAST(id % 10 AS INT) AS part")
+          .write.format("avro").partitionBy("part").save(factPath)
+        spark.range(10).selectExpr("CAST(id AS INT) AS dim_id", "id AS dim_val")
+          .write.format("avro").save(dimPath)
+        withTempView("fact", "dim") {
+          spark.read.format("avro").load(factPath).createOrReplaceTempView("fact")
+          spark.read.format("avro").load(dimPath).createOrReplaceTempView("dim")
+          Seq(
+            "SELECT f.id FROM fact f JOIN dim d ON f.part = d.dim_id WHERE d.dim_val = 7",
+            "SELECT id FROM fact WHERE part = (SELECT max(dim_id) FROM dim WHERE dim_val = 7)"
+          ).foreach { query =>
+            val df = sql(query)
+            checkAnswer(df, (0 until 10).map(i => Row(i * 10L + 7)))
+            val factScan = df.queryExecution.executedPlan.collectFirst {
+              case b: BatchScanExec if b.scan.isInstanceOf[AvroScan] && b.runtimeFilters.nonEmpty =>
+                b
+            }.getOrElse(fail(s"no Avro scan with runtime filters:\n${df.queryExecution}"))
+            val readParts = factScan.filteredPartitions.flatten
+              .flatMap(_.asInstanceOf[FilePartition].files.map(_.partitionValues.getInt(0)))
+            assert(readParts.distinct === Seq(7), query)
+          }
+        }
+      }
+    }
+  }
+
   test("Avro source v2: support partition pruning") {
     withTempPath { dir =>
       Seq(("a", 1, 2), ("b", 1, 2), ("c", 2, 1))
@@ -4411,6 +4445,41 @@ class AvroV2Suite extends AvroSuite with ExplainSuiteHelper {
             "columnName" -> "`g`",
             "columnType" -> expectedType,
             "format" -> "Avro"))
+      }
+    }
+  }
+
+  test("SPARK-60887: AvroTable schema inference respects legacy lowercase option flag") {
+    import org.apache.spark.sql.FakeFileSystemRequiringDSOption
+    import org.apache.spark.sql.execution.datasources.FakeFileSystemRequiringLowercaseDSOption
+
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(1).write.format("avro").save(path)
+      val fs = new org.apache.hadoop.fs.Path(path)
+        .getFileSystem(spark.sessionState.newHadoopConf())
+      val files = fs.listStatus(new org.apache.hadoop.fs.Path(path))
+        .filterNot(_.getPath.getName.startsWith("_")).toSeq
+      val dsOptions = new org.apache.spark.sql.util.CaseInsensitiveStringMap(
+        Map("ds_Option" -> "value").asJava)
+
+      withSQLConf(
+        SQLConf.LEGACY_LOWERCASE_DATA_SOURCE_OPTIONS_IN_HADOOP_CONF.key -> "true",
+        "fs.file.impl" -> classOf[FakeFileSystemRequiringLowercaseDSOption].getName,
+        "fs.file.impl.disable.cache" -> "true") {
+        val table = new org.apache.spark.sql.v2.avro.AvroTable(
+          "t", spark, dsOptions, Seq(path), None, classOf[AvroFileFormat])
+        assert(table.inferSchema(files).nonEmpty)
+      }
+      withSQLConf(
+        SQLConf.LEGACY_LOWERCASE_DATA_SOURCE_OPTIONS_IN_HADOOP_CONF.key -> "true",
+        "fs.file.impl" -> classOf[FakeFileSystemRequiringDSOption].getName,
+        "fs.file.impl.disable.cache" -> "true") {
+        val table = new org.apache.spark.sql.v2.avro.AvroTable(
+          "t", spark, dsOptions, Seq(path), None, classOf[AvroFileFormat])
+        intercept[IllegalArgumentException] {
+          table.inferSchema(files)
+        }
       }
     }
   }
